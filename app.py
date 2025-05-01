@@ -305,7 +305,7 @@ def update_forecast_graph(n_intervals):
         x=df['Label'], 
         y=df['EntryPointWeight'],
         mode='lines+markers', 
-        name='Forecasted Weight',
+        name='Forecast',
         marker=dict(color='green'),
         line=dict(width=2,color='green'),
         hovertemplate = 'Date: %{x}<br>Weight: %{y} Kg<extra></extra>'
