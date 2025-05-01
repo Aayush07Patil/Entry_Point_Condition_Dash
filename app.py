@@ -308,7 +308,7 @@ def update_forecast_graph(n_intervals):
         name='Forecasted Weight',
         marker=dict(color='green'),
         line=dict(width=2,color='green'),
-        hovertemplate = 'Date: %{x}<br>Weight: %{y:.2f} Kg<extra></extra>'
+        hovertemplate = 'Date: %{x}<br>Weight: %{y} Kg<extra></extra>'
     ))
     
     # Force capacity_weight to be a number if it's None or not numeric
@@ -328,7 +328,7 @@ def update_forecast_graph(n_intervals):
             mode='lines', 
             name='Pred Capacity',
             line=dict(color='red', width=2, dash='dash'),
-            hovertemplate= 'Pred Capacity: %{y:.2f} Kg<extra></extra>'
+            hovertemplate= 'Pred Capacity: %{y} Kg<extra></extra>'
         ))
     except (ValueError, TypeError) as e:
         print(f"Error adding capacity line: {str(e)}")
