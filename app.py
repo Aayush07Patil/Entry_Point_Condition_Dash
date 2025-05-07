@@ -6,6 +6,7 @@ import dash_bootstrap_components as dbc
 from datetime import datetime, timedelta
 from flask import request, jsonify
 import os
+import traceback
 
 # Optional pyodbc import
 try:
@@ -31,6 +32,9 @@ current_flight_data = {
 
 # Layout - full viewport with loading circle
 app.layout = html.Div([
+    # Store component to store the flight data
+    dcc.Store(id='flight-data-store'),
+    
     # Graph container with responsive layout and loading overlay
     dcc.Loading(
         id="loading-graph",
@@ -49,15 +53,18 @@ app.layout = html.Div([
         ]
     ),
     
-    # Hidden div to store the flight data from the .NET application
-    html.Div(id="flight-data-store", style={"display": "none"}),
-    
     # Add interval component to trigger updates
     dcc.Interval(
         id='interval-component',
-        interval=1200000,  # in milliseconds (5 minutes)
+        interval=1200000,  # in milliseconds (20 minutes)
         n_intervals=0
-    )
+    ),
+    
+    # Location component to track URL
+    dcc.Location(id='url', refresh=False),
+    
+    # Hidden div to trigger callback on page load
+    html.Div(id='page-load-trigger', style={'display': 'none'})
 ], style={
     "width": "100%",
     "height": "100vh",  # Use full viewport height
@@ -65,6 +72,49 @@ app.layout = html.Div([
     "margin": "0px",    # Remove margin
     "overflow": "hidden" # Prevent scrollbars
 })
+
+# Initialize Flask routes BEFORE Dash callbacks
+@server.before_request
+def before_request_func():
+    # Process query parameters on every request
+    query_params = request.args
+    if query_params:
+        # Debug log
+        print(f"INTERCEPTED QUERY PARAMS: {query_params}")
+        
+        # Update the global variable
+        global current_flight_data
+        
+        # Check if we're resetting the dashboard
+        if query_params.get('reset') == 'true':
+            print("Resetting dashboard data via query parameter")
+            current_flight_data = {
+                "flight_no": "",
+                "flight_date": datetime.now().date().isoformat(),
+                "flight_origin": "",
+                "flight_destination": ""
+            }
+        # Check if we have flight parameters
+        elif all(param in query_params for param in ['flight_no', 'flight_date', 'flight_origin', 'flight_destination']):
+            print("Updating dashboard data via query parameters")
+            current_flight_data = {
+                "flight_no": query_params.get('flight_no', ''),
+                "flight_date": query_params.get('flight_date', datetime.now().date().isoformat()),
+                "flight_origin": query_params.get('flight_origin', ''),
+                "flight_destination": query_params.get('flight_destination', '')
+            }
+            print(f"Updated flight data to: {current_flight_data}")
+
+# Callback to update the data store from URL
+@app.callback(
+    Output('flight-data-store', 'data'),
+    [Input('url', 'pathname'),
+     Input('url', 'search'),
+     Input('interval-component', 'n_intervals')]
+)
+def update_store_from_url(pathname, search, n_intervals):
+    # Return the current flight data from the global variable
+    return current_flight_data
 
 def get_forecast_and_capacity_data(flight_no, flight_date, origin, destination):
     """
@@ -200,6 +250,8 @@ def get_forecast_and_capacity_data(flight_no, flight_date, origin, destination):
     
     return forecast_df, capacity_weight
 
+# KEEP THE ORIGINAL POST ENDPOINTS FOR BACKWARD COMPATIBILITY
+
 # API endpoint to receive data from .NET application
 @server.route('/update-data', methods=['POST'])
 def update_data():
@@ -217,15 +269,15 @@ def update_data():
             "flight_destination": data.get("flight_destination", "")
         }
         
-        print(f"Received data: {current_flight_data}")
+        print(f"Received data via POST: {current_flight_data}")
         
         return jsonify({"status": "success", "message": "Data received successfully"}), 200
     
     except Exception as e:
-        print(f"Error processing data: {e}")
+        print(f"Error processing POST data: {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
 
-# New API endpoint to reset data
+# API endpoint to reset data
 @server.route('/reset-data', methods=['POST'])
 def reset_data():
     global current_flight_data
@@ -239,141 +291,176 @@ def reset_data():
             "flight_destination": ""
         }
         
-        print("Dashboard data reset successfully")
+        print("Dashboard data reset via POST")
         
         return jsonify({"status": "success", "message": "Data reset successfully"}), 200
     
     except Exception as e:
-        print(f"Error resetting data: {e}")
+        print(f"Error resetting data via POST: {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
 
-# Callback to update the graph container based on stored flight data
-@callback(
+# Callback to update the graph based on stored flight data
+@app.callback(
     Output("graph-container", "children"),
-    [Input("interval-component", "n_intervals")]
+    [Input("flight-data-store", "data")]
 )
-def update_forecast_graph(n_intervals):
-    # Get the current flight data
-    flight_no = current_flight_data["flight_no"]
-    flight_date = current_flight_data["flight_date"]
-    origin = current_flight_data["flight_origin"]
-    destination = current_flight_data["flight_destination"]
-    
-    if not all([flight_no, flight_date, origin, destination]):
-        return html.Div("Waiting for flight data...", 
-                        style={
-                            "display": "flex",
-                            "justifyContent": "center",
-                            "alignItems": "center",
-                            "height": "100%",
-                            "fontSize": "16px"
-                        })
-
-    # Get both forecast data and capacity weight
-    df, capacity_weight = get_forecast_and_capacity_data(flight_no, flight_date, origin, destination)
-
-    if df.empty:
-        return html.Div("No forecast data found for the given parameters.", 
-                        style={
-                            "display": "flex",
-                            "justifyContent": "center",
-                            "alignItems": "center",
-                            "height": "100%",
-                            "fontSize": "16px"
-                        })
-
-    # Add error checking before using .dt accessor
-    if pd.api.types.is_datetime64_any_dtype(df['ForecastDate']):
-        df['Label'] = df['ForecastDate'].dt.strftime('%d %b').str.upper()
-    else:
-        # Handle the case where conversion to datetime failed
-        print("Warning: ForecastDate column is not in datetime format. Attempting to convert...")
-        df['ForecastDate'] = pd.to_datetime(df['ForecastDate'], errors='coerce')
+def update_forecast_graph(flight_data):
+    try:
+        # Use the flight data from the store if available
+        if flight_data:
+            flight_no = flight_data.get("flight_no", "")
+            flight_date = flight_data.get("flight_date", "")
+            origin = flight_data.get("flight_origin", "")
+            destination = flight_data.get("flight_destination", "")
+        else:
+            # Fall back to global variable if store is empty
+            flight_no = current_flight_data["flight_no"]
+            flight_date = current_flight_data["flight_date"]
+            origin = current_flight_data["flight_origin"]
+            destination = current_flight_data["flight_destination"]
         
-        # Check if conversion was successful
+        # For debugging
+        print(f"Updating forecast graph with: Flight={flight_no}, Date={flight_date}, Origin={origin}, Dest={destination}")
+        
+        if not all([flight_no, flight_date, origin, destination]):
+            return html.Div("Waiting for flight data...", 
+                            style={
+                                "display": "flex",
+                                "justifyContent": "center",
+                                "alignItems": "center",
+                                "height": "100%",
+                                "fontSize": "16px"
+                            })
+
+        # Get both forecast data and capacity weight
+        df, capacity_weight = get_forecast_and_capacity_data(flight_no, flight_date, origin, destination)
+
+        if df.empty:
+            return html.Div(f"No forecast data found for flight {flight_no} from {origin} to {destination} on {flight_date}.", 
+                            style={
+                                "display": "flex",
+                                "justifyContent": "center",
+                                "alignItems": "center",
+                                "height": "100%",
+                                "fontSize": "16px"
+                            })
+
+        # Add error checking before using .dt accessor
         if pd.api.types.is_datetime64_any_dtype(df['ForecastDate']):
             df['Label'] = df['ForecastDate'].dt.strftime('%d %b').str.upper()
         else:
-            # If conversion failed, use index as label
-            print("Could not convert ForecastDate to datetime. Using index as label.")
-            df['Label'] = [f"Day {i+1}" for i in range(len(df))]
+            # Handle the case where conversion to datetime failed
+            print("Warning: ForecastDate column is not in datetime format. Attempting to convert...")
+            df['ForecastDate'] = pd.to_datetime(df['ForecastDate'], errors='coerce')
+            
+            # Check if conversion was successful
+            if pd.api.types.is_datetime64_any_dtype(df['ForecastDate']):
+                df['Label'] = df['ForecastDate'].dt.strftime('%d %b').str.upper()
+            else:
+                # If conversion failed, use index as label
+                print("Could not convert ForecastDate to datetime. Using index as label.")
+                df['Label'] = [f"Day {i+1}" for i in range(len(df))]
 
-    fig = go.Figure()
-    
-    # Add the forecast weight line
-    fig.add_trace(go.Scatter(
-        x=df['Label'], 
-        y=df['EntryPointWeight'],
-        mode='lines+markers', 
-        name='Forecast',
-        marker=dict(color='green'),
-        line=dict(width=2,color='green'),
-        hovertemplate = 'Date: %{x}<br>Weight: %{y} Kg<extra></extra>'
-    ))
-    
-    # Force capacity_weight to be a number if it's None or not numeric
-    if capacity_weight is None:
-        # Default to 10% above max forecast weight if capacity is None
-        capacity_weight = df['EntryPointWeight'].max() * 1.1
-        print(f"Using default capacity weight: {capacity_weight}")
-    
-    try:
-        # Try to convert to float to ensure it's numeric
-        capacity_weight = float(capacity_weight)
+        fig = go.Figure()
         
-        # Add the capacity weight as a horizontal line
+        # Add the forecast weight line
         fig.add_trace(go.Scatter(
             x=df['Label'], 
-            y=[capacity_weight] * len(df),
-            mode='lines', 
-            name='Pred Capacity',
-            line=dict(color='red', width=2, dash='dash'),
-            hovertemplate= 'Pred Capacity: %{y} Kg<extra></extra>'
+            y=df['EntryPointWeight'],
+            mode='lines+markers', 
+            name='Forecast',
+            marker=dict(color='green'),
+            line=dict(width=2,color='green'),
+            hovertemplate = 'Date: %{x}<br>Weight: %{y} Kg<extra></extra>'
         ))
-    except (ValueError, TypeError) as e:
-        print(f"Error adding capacity line: {str(e)}")
+        
+        # Force capacity_weight to be a number if it's None or not numeric
+        if capacity_weight is None:
+            # Default to 10% above max forecast weight if capacity is None
+            capacity_weight = df['EntryPointWeight'].max() * 1.1
+            print(f"Using default capacity weight: {capacity_weight}")
+        
+        try:
+            # Try to convert to float to ensure it's numeric
+            capacity_weight = float(capacity_weight)
+            
+            # Add the capacity weight as a horizontal line
+            fig.add_trace(go.Scatter(
+                x=df['Label'], 
+                y=[capacity_weight] * len(df),
+                mode='lines', 
+                name='Pred Capacity',
+                line=dict(color='red', width=2, dash='dash'),
+                hovertemplate= 'Pred Capacity: %{y} Kg<extra></extra>'
+            ))
+        except (ValueError, TypeError) as e:
+            print(f"Error adding capacity line: {str(e)}")
+        
+        # Update layout to match other dashboards
+        fig.update_layout(
+            title=dict(
+                text=f'Forecasted Entry Point Condition - Weight: {flight_no} {origin}-{destination}',
+                x=0.5,  # Center title
+                y=0.98  # Position near top
+            ),
+            xaxis_title="Forecast Date",
+            yaxis_title="Weight (kg)",
+            xaxis=dict(
+                tickmode='array',
+                tickvals=df['Label'],
+                ticktext=df['Label'],
+                tickangle=45,
+            ),
+            legend=dict(
+                x=1.05,        # Just outside the right side
+                y=1,           # Align to top
+                xanchor='left',
+                yanchor='top',
+                bgcolor='rgba(255,255,255,0.8)',  # Semi-transparent background
+                bordercolor='black',
+                borderwidth=1
+            ),
+            template='plotly_white',
+            margin=dict(l=50, r=100, t=60, b=50),
+            autosize=True,
+            height=None
+        )
+        
+        return dcc.Graph(
+            figure=fig,
+            style={
+                'height': '100%',  # Take full height of parent container
+                'width': '100%'    # Take full width of parent container
+            },
+            config={
+                'responsive': True,  # Enable responsiveness
+                'displayModeBar': False  # Hide the mode bar for cleaner appearance
+            }
+        )
     
-    # Update layout to match other dashboards
-    fig.update_layout(
-        title=dict(
-            text='Forecasted Entry Point Condition - Weight',
-            x=0.5,  # Center title
-            y=0.98  # Position near top
-        ),
-        xaxis_title="Forecast Date",
-        yaxis_title="Weight (kg)",
-        xaxis=dict(
-            tickmode='array',
-            tickvals=df['Label'],
-            ticktext=df['Label'],
-            tickangle=45,
-        ),
-        legend=dict(
-            x=1.05,        # Just outside the right side
-            y=1,           # Align to top
-            xanchor='left',
-            yanchor='top',
-            bgcolor='rgba(255,255,255,0.8)',  # Semi-transparent background
-            bordercolor='black',
-            borderwidth=1
-        ),
-        template='plotly_white',
-        margin=dict(l=50, r=100, t=60, b=50),
-        autosize=True,
-        height=None
-    )
-    
-    return dcc.Graph(
-        figure=fig,
-        style={
-            'height': '100%',  # Take full height of parent container
-            'width': '100%'    # Take full width of parent container
-        },
-        config={
-            'responsive': True,  # Enable responsiveness
-            'displayModeBar': False  # Hide the mode bar for cleaner appearance
-        }
-    )
+    except Exception as e:
+        # Get full stack trace for debugging
+        stack_trace = traceback.format_exc()
+        print(f"Error: {e}")
+        print(f"Stack trace: {stack_trace}")
+        
+        return html.Div(f"Error updating graph: {str(e)}", 
+                        style={
+                            "display": "flex",
+                            "justifyContent": "center",
+                            "alignItems": "center",
+                            "height": "100%",
+                            "fontSize": "16px",
+                            "color": "red"
+                        })
+
+# Add route to handle root path and query parameters
+@server.route('/')
+def index():
+    # This is just to log when the root route is accessed with query parameters
+    if request.args:
+        print(f"Root route accessed with query parameters: {request.args}")
+    return app.index()
 
 if __name__ == '__main__':
-    app.run_server(debug=False, host='0.0.0.0',port=int(os.environ.get('PORT',8050)))
+    app.run_server(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 8050)))
